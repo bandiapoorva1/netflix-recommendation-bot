@@ -3,10 +3,14 @@ import streamlit as st
 import pandas as pd
 import pickle
 import numpy as np
+import openai
 import requests
 from sklearn.metrics.pairwise import cosine_similarity
 
-st.set_page_config(page_title="Netflix Recommender", layout="centered")
+st.set_page_config(page_title="Netflix AI Recommender", layout="centered")
+
+openai.api_key = "{openai_api_key}"
+OMDB_API_KEY = "519fa74f"
 
 @st.cache_resource
 def load_data():
@@ -18,53 +22,14 @@ def load_data():
     return df, bert_embeddings, collab_model
 
 df, bert_embeddings, collab_model = load_data()
+df['release_year'] = pd.to_numeric(df['release_year'], errors='coerce')
+df['duration_min'] = df['duration'].str.extract(r'(\d+)').astype(float)
 titles = df['title'].tolist()
 
-st.markdown(
-    '''
-    <style>
-        .title {
-            font-size: 2.5em;
-            font-weight: bold;
-            text-align: center;
-            margin-bottom: 10px;
-        }
-        .recommendation-card {
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 15px;
-            padding: 1rem;
-            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.2);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            margin-bottom: 1rem;
-            text-align: center;
-        }
-        img {
-            max-width: 100%;
-            border-radius: 10px;
-        }
-    </style>
-    ''',
-    unsafe_allow_html=True
-)
-
-st.markdown('<div class="title">🎬 Netflix Recommendation Bot</div>', unsafe_allow_html=True)
-st.write("Get personalized Netflix recommendations using hybrid AI (BERT + SVD).")
-
-selected_title = st.selectbox("🔍 Start typing a Netflix title:", titles)
-
-available_genres = sorted(set(genre.strip() for g in df['listed_in'].dropna() for genre in g.split(',')))
-selected_genres = st.multiselect("🎭 Filter by Genre", available_genres)
-
-df['release_year'] = pd.to_numeric(df['release_year'], errors='coerce')
-min_year, max_year = int(df['release_year'].min()), int(df['release_year'].max())
-selected_year = st.slider("📅 Filter by Release Year", min_year, max_year, (min_year, max_year))
-
 def fetch_omdb_data(title):
-    url = f"http://www.omdbapi.com/?apikey=519fa74f&t={title}"
+    url = f"http://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={title}"
     try:
-        response = requests.get(url.format(title=title))
+        response = requests.get(url)
         data = response.json()
         return {
             'poster': data.get('Poster', ''),
@@ -74,44 +39,88 @@ def fetch_omdb_data(title):
     except:
         return {'poster': '', 'rating': 'N/A', 'year': 'N/A'}
 
-def get_hybrid_recommendations(input_title, user_id=1, top_n=5):
-    if input_title not in df['title'].values:
-        return []
-    idx = df[df['title'] == input_title].index[0]
-    sims = cosine_similarity([bert_embeddings[idx]], bert_embeddings).flatten()
-    similar_idxs = sims.argsort()[::-1][1:100]
+def parse_query(query):
+    prompt = f"""
+    Extract the following from this movie recommendation query:
+    - reference title (optional)
+    - genre (optional)
+    - year range (optional, e.g., 2010-2020)
+    - max runtime in minutes (optional)
+
+    Query: '{query}'
+    Return as JSON.
+    """
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
+        )
+        content = response['choices'][0]['message']['content']
+        return eval(content)
+    except Exception as e:
+        st.error(f"LLM failed: {e}")
+        return {}
+
+def get_recommendations(query, sort_by="score"):
+    params = parse_query(query)
+    ref_title = params.get("reference title", "")
+    genre = params.get("genre", "").lower()
+    year_range = params.get("year range", "")
+    max_runtime = params.get("max runtime in minutes", None)
 
     results = []
+    if ref_title and ref_title in df['title'].values:
+        idx = df[df['title'] == ref_title].index[0]
+        sims = cosine_similarity([bert_embeddings[idx]], bert_embeddings).flatten()
+        similar_idxs = sims.argsort()[::-1][1:100]
+    else:
+        sims = cosine_similarity(bert_embeddings, bert_embeddings)
+        similar_idxs = np.argsort(-sims.mean(axis=0))[:100]
+
     for i in similar_idxs:
         row = df.iloc[i]
         title = row['title']
-        genres = row.get('listed_in', '')
-        year = row.get('release_year', 0)
+        genres = row['listed_in'].lower() if pd.notnull(row['listed_in']) else ""
+        year = row['release_year']
+        duration = row['duration_min']
 
-        if selected_genres and not any(g.strip() in genres for g in selected_genres):
+        if genre and genre not in genres:
             continue
-        if not (selected_year[0] <= int(year) <= selected_year[1]):
+        if year_range:
+            try:
+                start, end = map(int, year_range.split('-'))
+                if not (start <= year <= end):
+                    continue
+            except:
+                pass
+        if max_runtime and duration and duration > max_runtime:
             continue
 
-        est = collab_model.predict(user_id, title).est
+        est = collab_model.predict(1, title).est
         results.append((title, est))
 
-    results = sorted(results, key=lambda x: x[1], reverse=True)
-    return results[:top_n]
+    if sort_by == "rating":
+        results = sorted(results, key=lambda x: float(fetch_omdb_data(x[0])['rating'] or 0), reverse=True)
+    elif sort_by == "year":
+        results = sorted(results, key=lambda x: int(fetch_omdb_data(x[0])['year'] or 0), reverse=True)
+    else:
+        results = sorted(results, key=lambda x: x[1], reverse=True)
 
-if st.button("Recommend"):
-    with st.spinner("Crunching recommendations with hybrid AI..."):
-        recs = get_hybrid_recommendations(selected_title, user_id=1, top_n=5)
+    return results[:5]
 
-    st.subheader("🎯 Top Recommendations")
+st.title("🎬 Netflix AI Recommendation Bot")
+query = st.text_input("🧠 Describe what you're in the mood to watch:")
+sort_by = st.selectbox("🔽 Sort by:", ["score", "rating", "year"])
+
+if st.button("Get Recommendations"):
+    with st.spinner("Asking the AI..."):
+        recs = get_recommendations(query, sort_by=sort_by)
+
     for title, score in recs:
         info = fetch_omdb_data(title)
-        poster_html = f'<img src="{info["poster"]}" width="150">' if info["poster"] and info["poster"] != "N/A" else ""
-        st.markdown(f'''
-        <div class="recommendation-card">
-            {poster_html}
-            <h4>{title}</h4>
-            <p>⭐ IMDb Rating: {info["rating"]} | 📅 {info["year"]}</p>
-            <p>Predicted Interest Score: <strong>{score:.2f}</strong></p>
-        </div>
-        ''', unsafe_allow_html=True)
+        st.image(info["poster"], width=160)
+        st.markdown(f"**{title}**")
+        st.markdown(f"⭐ IMDb Rating: {info['rating']} | 📅 {info['year']}")
+        st.markdown(f"🔮 Interest Score: {score:.2f}")
+        st.markdown("---")
