@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import pickle
 import numpy as np
+import requests
 from sklearn.metrics.pairwise import cosine_similarity
 
 st.set_page_config(page_title="Netflix Recommender", layout="centered")
@@ -37,6 +38,11 @@ st.markdown(
             -webkit-backdrop-filter: blur(8px);
             border: 1px solid rgba(255, 255, 255, 0.1);
             margin-bottom: 1rem;
+            text-align: center;
+        }
+        img {
+            max-width: 100%;
+            border-radius: 10px;
         }
     </style>
     ''',
@@ -48,22 +54,29 @@ st.write("Get personalized Netflix recommendations using hybrid AI (BERT + SVD).
 
 selected_title = st.selectbox("🔍 Start typing a Netflix title:", titles)
 
-# Genre filter
 available_genres = sorted(set(genre.strip() for g in df['listed_in'].dropna() for genre in g.split(',')))
 selected_genres = st.multiselect("🎭 Filter by Genre", available_genres)
 
-# Language filter
-available_languages = sorted(df['language'].dropna().unique())
-selected_languages = st.multiselect("🌐 Filter by Language", available_languages)
-
-# Release year filter
 df['release_year'] = pd.to_numeric(df['release_year'], errors='coerce')
 min_year, max_year = int(df['release_year'].min()), int(df['release_year'].max())
 selected_year = st.slider("📅 Filter by Release Year", min_year, max_year, (min_year, max_year))
 
+def fetch_omdb_data(title):
+    url = f"http://www.omdbapi.com/?apikey=519fa74f&t={title}"
+    try:
+        response = requests.get(url.format(title=title))
+        data = response.json()
+        return {
+            'poster': data.get('Poster', ''),
+            'rating': data.get('imdbRating', 'N/A'),
+            'year': data.get('Year', 'N/A')
+        }
+    except:
+        return {'poster': '', 'rating': 'N/A', 'year': 'N/A'}
+
 def get_hybrid_recommendations(input_title, user_id=1, top_n=5):
     if input_title not in df['title'].values:
-        return ["Title not found."]
+        return []
     idx = df[df['title'] == input_title].index[0]
     sims = cosine_similarity([bert_embeddings[idx]], bert_embeddings).flatten()
     similar_idxs = sims.argsort()[::-1][1:100]
@@ -73,12 +86,9 @@ def get_hybrid_recommendations(input_title, user_id=1, top_n=5):
         row = df.iloc[i]
         title = row['title']
         genres = row.get('listed_in', '')
-        language = row.get('language', '')
         year = row.get('release_year', 0)
 
         if selected_genres and not any(g.strip() in genres for g in selected_genres):
-            continue
-        if selected_languages and language not in selected_languages:
             continue
         if not (selected_year[0] <= int(year) <= selected_year[1]):
             continue
@@ -95,9 +105,13 @@ if st.button("Recommend"):
 
     st.subheader("🎯 Top Recommendations")
     for title, score in recs:
+        info = fetch_omdb_data(title)
+        poster_html = f'<img src="{info["poster"]}" width="150">' if info["poster"] and info["poster"] != "N/A" else ""
         st.markdown(f'''
         <div class="recommendation-card">
+            {poster_html}
             <h4>{title}</h4>
-            <p>Predicted Interest Score: ⭐ {score:.2f}</p>
+            <p>⭐ IMDb Rating: {info["rating"]} | 📅 {info["year"]}</p>
+            <p>Predicted Interest Score: <strong>{score:.2f}</strong></p>
         </div>
         ''', unsafe_allow_html=True)
